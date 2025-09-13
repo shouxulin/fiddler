@@ -510,13 +510,34 @@ class FiddlerMixtral:
 
             if self.cpu_offload == 0:
                 # baseline: do everything at GPU
+                
+                
+                """
+                After one_hot, entry (t, s, e) is 1 iff token t's slot s (0 or 1) picked expert e.
+                After .permute(2,1,0), you get (e, s, t). Now expert_mask[e] is a 2*N mask for expert e:
+                    row s=0 means “tokens where e was the 1st choice”
+                    row s=1 means “tokens where e was the 2nd choice”
+                """
+                
                 expert_mask = torch.nn.functional.one_hot(
                     selected_experts, num_classes=8
                 ).permute(2, 1, 0)
+                
 
                 for i_expert in range(len(experts)):
                     is_cuda = self.is_expert_in_gpu(i_layer, i_expert)
+                    
+                    """
+                    idx is a vector of 0/1 telling which top-k slot (first or second) picked this expert.
+                    top_2 is the token index (0..N-1) for those matches.
+                    so each element in idx is either 0 or 1, meaning this is top 1 or top2.
+                    Each top_2 is the token_index.
+                    For example, idx[0]=0 and top2[0] =1 means the token with id 1 choose i_expert as the top 1 expert.
+                    The sizes of idx and top_2 depend on how many tokens chose a given expert
+                    """
                     idx, top_2 = torch.where(expert_mask[i_expert])
+                    
+                    
 
                     if top_2.shape[0] == 0:
                         # print(f"Expert {i_expert}: has no tokens")
@@ -525,7 +546,12 @@ class FiddlerMixtral:
                     # torch.cuda.synchronize()
                     top_2_list = top_2.tolist()
                     idx_list = idx.tolist()
-
+                    
+                    
+                    """
+                    current_state has shape (K, D).
+                    So you end up with just the hidden states of those K tokens, stacked in a new mini-batch for this expert.
+                    """
                     current_state = inps[None, top_2_list].reshape(-1, hidden_dim)
                     if not is_cuda:
                         self.expert_placeholder.load_state_dict(
@@ -538,6 +564,11 @@ class FiddlerMixtral:
                         current_state = experts[i_expert](
                             current_state, routing_weights[top_2_list, idx_list, None]
                         )
+                        
+                    """
+                    For each j in 0…K-1:
+                        inps_after_experts[top_2[j]] += current_state[j] # add the expert output to the right token
+                    """
                     inps_after_experts.index_add_(
                         0, top_2, current_state.to(inps.dtype)
                     )
