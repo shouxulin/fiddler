@@ -9,6 +9,19 @@ from torch.nn.utils.rnn import pad_sequence
 import transformers
 
 
+def _pin_module_tensors(m: torch.nn.Module):
+    # Pin all floating/complex params & buffers in-place.
+    # Note: .pin_memory() returns a *pinned* tensor (new storage) on CPU.
+    for p in m.parameters(recurse=True):
+        if p.device.type == 'cpu' and (p.is_floating_point() or p.is_complex()):
+            if not p.is_pinned():
+                p.data = p.data.contiguous().pin_memory()
+    for b in m.buffers(recurse=True):
+        if isinstance(b, torch.Tensor) and b.device.type == 'cpu':
+            if (b.is_floating_point() or b.is_complex()) and not b.is_pinned():
+                b.data = b.data.contiguous().pin_memory()
+
+
 class FiddlerMixtral:
     def __init__(self, args):
         self.dtype = torch.bfloat16
@@ -54,6 +67,8 @@ class FiddlerMixtral:
         # print(self.expert_loc)
 
         self.bring_expert_to_gpu()
+        
+        self.bring_cold_experts_to_pinned_cpu()
 
         print("Model is ready.")
 
@@ -343,6 +358,21 @@ class FiddlerMixtral:
             for j in range(self.n_expert):
                 if self.is_expert_in_gpu(i, j):
                     self.model.layers[i].block_sparse_moe.experts[j].to(self.dev)
+                    
+
+                    
+    def bring_cold_experts_to_pinned_cpu(self):
+        """
+        For experts NOT selected for GPU residency, ensure they are on CPU
+        and pin their tensors (page-locked host memory).
+        """
+        for i in range(self.n_layer):
+            for j in range(self.n_expert):
+                if not self.is_expert_in_gpu(i, j):
+                    expert = self.model.layers[i].block_sparse_moe.experts[j]
+                    # Move to CPU (non_blocking has no effect CPU->CPU but harmless)
+                    expert.to('cpu', non_blocking=True)
+                    _pin_module_tensors(expert)
 
     def is_expert_in_gpu(self, i_layer, i_expert):
         """Determine if the expert is in GPU"""
@@ -357,7 +387,8 @@ class FiddlerMixtral:
         )
         # get the amount of free memory on GPU
         total_mem = torch.cuda.get_device_properties(self.dev).total_memory
-        free_mem = total_mem * 0.95 - torch.cuda.memory_allocated(self.dev) # TODO: magic number
+        # free_mem = total_mem * 0.95 - torch.cuda.memory_allocated(self.dev) # TODO: magic number
+        free_mem = total_mem * 0.4 - torch.cuda.memory_allocated(self.dev) # TODO: magic number
         return int((free_mem) // (n_param * 2))
 
     def initial_beam_tensor(self, input_tensor):
@@ -452,7 +483,8 @@ class FiddlerMixtral:
         return (
             prefill_time,
             decode_time,
-            self.cnt_expert_hit / self.cnt_expert_all,
+            # self.cnt_expert_hit / self.cnt_expert_all,
+            0
         )
 
     def tokenize(self, text):
@@ -480,6 +512,9 @@ class FiddlerMixtral:
         inps = self.model.embed_tokens(inps)
 
         for i_layer, layer in enumerate(self.model.layers):
+            
+            torch.cuda.nvtx.range_push(f"GPU layer{i_layer}-before")
+            
             original_inps_shape = inps.shape
 
             inps_residual = inps
@@ -507,6 +542,8 @@ class FiddlerMixtral:
             # intermediate variable to store the output of experts
             inps_after_experts = torch.zeros_like(inps, device=self.dev)
             experts = layer.block_sparse_moe.experts
+            
+            torch.cuda.nvtx.range_pop()
 
             if self.cpu_offload == 0:
                 # baseline: do everything at GPU
@@ -579,6 +616,8 @@ class FiddlerMixtral:
                     # end of one expert
 
             else:
+                torch.cuda.nvtx.range_push(f"GPU layer{i_layer}-pre moe")
+                
                 # prefill stage with offloading
                 expert_mask = torch.nn.functional.one_hot(
                     selected_experts, num_classes=8
@@ -590,77 +629,133 @@ class FiddlerMixtral:
                     (len(experts), 2), dtype=float
                 )  # 0: CPU, 1: GPU
                 for i_expert in range(len(experts)):
+                    torch.cuda.nvtx.range_push(f"layer-{i_layer}-expert-{i_expert}-where")
                     idx, top_2 = torch.where(expert_mask[i_expert])
+                    torch.cuda.nvtx.range_pop()
+                    
+                    # print out device type of idx
+                    print(f"Layer {i_layer} Expert {i_expert} idx device: {idx.device}, top_2 device: {top_2.device}")
+                    
+                    torch.cuda.nvtx.range_push(f"layer-{i_layer}-expert-{i_expert}-append")
                     idxs.append(idx)
                     top_2s.append(top_2)
-                    # expected latency at CPU: number of token * cost_at_cpu
-                    # expected latency at GPU: cost_at_gpu (constant)
-                    cost_per_expert[i_expert, 0] = top_2.shape[0] * self.latency_cpu
-                    cost_per_expert[i_expert, 1] = self.latency_gpu
-                    if self.is_expert_in_gpu(i_layer, i_expert):
-                        # if the expert is in GPU, the latency at GPU is
-                        # approximately 0
-                        cost_per_expert[i_expert, 1] = 0
-                        self.cnt_expert_hit += top_2.shape[0]
-                    self.cnt_expert_all += top_2.shape[0]
+                    torch.cuda.nvtx.range_pop()
+                    
+                    # # expected latency at CPU: number of token * cost_at_cpu
+                    # # expected latency at GPU: cost_at_gpu (constant)
+                    # cost_per_expert[i_expert, 0] = top_2.shape[0] * self.latency_cpu
+                    # cost_per_expert[i_expert, 1] = self.latency_gpu
+                    # if self.is_expert_in_gpu(i_layer, i_expert):
+                    #     # if the expert is in GPU, the latency at GPU is
+                    #     # approximately 0
+                    #     cost_per_expert[i_expert, 1] = 0
+                    #     self.cnt_expert_hit += top_2.shape[0]
+                    # self.cnt_expert_all += top_2.shape[0]
+                    
+                torch.cuda.nvtx.range_pop()
                 
-                # second, partition experts processing between CPU and GPU so that we can minimize:
-                # max(sum of cost at CPU, sum of cost at GPU)
-                # greedy algorithm is just as there are only 8 experts for Mixtral
-                best_config = -1
-                best_cost = float("inf")
-                for config in range(1 << len(experts)):
-                    sum_cost = 0
-                    for i_expert in range(len(experts)):
-                        if (config >> i_expert) & 1:
-                            sum_cost += cost_per_expert[i_expert, 0]
-                        else:
-                            sum_cost += cost_per_expert[i_expert, 1]
-                    if sum_cost < best_cost:
-                        best_cost = sum_cost
-                        best_config = config
+                # # second, partition experts processing between CPU and GPU so that we can minimize:
+                # # max(sum of cost at CPU, sum of cost at GPU)
+                # # greedy algorithm is just as there are only 8 experts for Mixtral
+                # best_config = -1
+                # best_cost = float("inf")
+                # for config in range(1 << len(experts)):
+                #     sum_cost = 0
+                #     for i_expert in range(len(experts)):
+                #         if (config >> i_expert) & 1:
+                #             sum_cost += cost_per_expert[i_expert, 0]
+                #         else:
+                #             sum_cost += cost_per_expert[i_expert, 1]
+                #     if sum_cost < best_cost:
+                #         best_cost = sum_cost
+                #         best_config = config
 
-                # then, we can offload the experts according to the best
-                # configuration
+                # # then, we can offload the experts according to the best
+                # # configuration
+                # cpu_experts = []
+                # gpu_experts = []
+                # for i_expert in range(8):
+                #     if (best_config >> i_expert) & 1:
+                #         cpu_experts.append(i_expert)
+                #     else:
+                #         gpu_experts.append(i_expert)
+                # gpu_experts.extend(cpu_experts)
+                # gpu_experts.sort()
+                # cpu_experts = []
+                
+                gpu_experts = list(range(8))
                 cpu_experts = []
-                gpu_experts = []
-                for i_expert in range(8):
-                    if (best_config >> i_expert) & 1:
-                        cpu_experts.append(i_expert)
-                    else:
-                        gpu_experts.append(i_expert)
+                        
+                # for e in gpu_experts:
+                #     print(f"Layer {i_layer} GPU Expert {e} at {'GPU' if self.is_expert_in_gpu(i_layer, e) else 'CPU'}")
 
                 for i_expert in gpu_experts:
-                    top_2_list = top_2s[i_expert].tolist()
-                    idx_list = idxs[i_expert].tolist()
-                    current_state = inps[None, top_2_list].reshape(-1, hidden_dim)
+                    # top_2_list = top_2s[i_expert].tolist()
+                    # idx_list = idxs[i_expert].tolist()
+                    
+                    top_2_list = top_2s[i_expert]
+                    idx_list = idxs[i_expert]
+                    
+                    
+                    # current_state = inps[None, top_2_list].reshape(-1, hidden_dim)
+                    current_state = inps.index_select(0, top_2_list)
+                    
+                    rw_rows  = routing_weights.index_select(0, top_2_list)     # (K, 2)
+                    weights  = rw_rows.gather(1, idx_list.unsqueeze(1))  # (K, 1)
+                    
                     if self.is_expert_in_gpu(i_layer, i_expert):
-                        current_state = experts[i_expert](
-                            current_state, routing_weights[top_2_list, idx_list, None]
-                        )
+                        torch.cuda.nvtx.range_push(f"GPU layer{i_layer}-expert{i_expert}-exe")
+                        
+                        # current_state = experts[i_expert](
+                        #     current_state, routing_weights[top_2_list, idx_list, None]
+                        # )
+                        current_state = experts[i_expert](current_state, weights)
+                        
+                        torch.cuda.nvtx.range_pop()
                     else:
+                        torch.cuda.nvtx.range_push(f"GPU layer{i_layer}-expert{i_expert}->copy weights")
                         self.expert_placeholder.load_state_dict(
                             experts[i_expert].state_dict()
                         )
-                        current_state = self.expert_placeholder(
-                            current_state, routing_weights[top_2_list, idx_list, None]
-                        )
+                        torch.cuda.nvtx.range_pop()
+                        
+                        torch.cuda.nvtx.range_push(f"GPU layer{i_layer}-expert{i_expert}-exe")
+                        
+                        # current_state = self.expert_placeholder(
+                        #     current_state, routing_weights[top_2_list, idx_list, None]
+                        # )
+                        
+                        current_state = self.expert_placeholder(current_state, weights)
+                        
+                        torch.cuda.nvtx.range_pop()
+                    
+                    torch.cuda.nvtx.range_push(f"GPU layer{i_layer}-expert{i_expert}-aggre")
+                    # inps_after_experts.index_add_(
+                    #     0,
+                    #     top_2s[i_expert].to(self.dev, non_blocking=True),
+                    #     current_state.to(self.dev, non_blocking=True),
+                    # )
                     inps_after_experts.index_add_(
-                        0,
-                        top_2s[i_expert].to(self.dev, non_blocking=True),
-                        current_state.to(self.dev, non_blocking=True),
+                        0, top_2_list, current_state.to(self.dev, non_blocking=True),
                     )
+                    
+                    torch.cuda.nvtx.range_pop()
 
                 for i_expert in cpu_experts:
                     top_2_list = top_2s[i_expert].tolist()
                     idx_list = idxs[i_expert].tolist()
                     current_state = inps[None, top_2_list].reshape(-1, hidden_dim)
+                    
+                    torch.cuda.nvtx.range_push(f"Host layer{i_layer}-expert{i_expert}-exe")
                     current_state = self.run_expert_at_cpu(
                         i_layer,
                         i_expert,
                         current_state.to("cpu"),
                         routing_weights[top_2_list, idx_list, None].to("cpu"),
                     )
+                    torch.cuda.nvtx.range_pop()
+                    
+                    
                     inps_after_experts.index_add_(
                         0,
                         top_2s[i_expert].to(self.dev, non_blocking=True),
