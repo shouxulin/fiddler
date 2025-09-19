@@ -163,3 +163,4 @@ cython_debug/
 .vscode
 **/profile
 **/binary
+**/bin
