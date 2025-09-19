@@ -1,15 +1,97 @@
 #include <cublas_v2.h>
 #include <cuda_bf16.h>   // for __nv_bfloat16 (CUDA 11+)
 #include <stdexcept>
-
+#include <random>
 #include <cstring>
 #include <algorithm>
 #include <omp.h>
+#include <cmath>
+#include <cuda.h>
 
 
 #include <cstdio>
 #include <cstdlib>
 
+#ifdef USE_CURAND
+#include <curand_kernel.h>
+#endif
+
+
+// Round-to-nearest-even FP32 -> BF16 (host)
+inline uint16_t f32_to_bf16_rne(float f) {
+    uint32_t x; memcpy(&x, &f, sizeof(x));
+    uint32_t lsb = (x >> 16) & 1U;
+    uint32_t round_bias = 0x7FFFu + lsb;  // RNE with tie-to-even
+    x += round_bias;
+    return uint16_t(x >> 16);
+}
+
+// Optional: BF16 -> FP32 (handy for CPU-side checks)
+inline float bf16_to_f32(uint16_t h) {
+    uint32_t x = (uint32_t(h) << 16);
+    float f; memcpy(&f, &x, sizeof(f));
+    return f;
+}
+
+// Fill a BF16 buffer (host) with uniform random in [-scale, scale]
+inline void random_bf16(uint16_t* dst, size_t n, float scale=0.02f, uint64_t seed=1234) {
+    std::mt19937_64 rng(seed);
+    std::uniform_real_distribution<float> dist(-scale, scale);
+    for (size_t i=0; i<n; ++i) {
+        float r = dist(rng);                // ephemeral FP32 (not stored)
+        dst[i] = f32_to_bf16_rne(r);        // store only BF16
+    }
+}
+
+
+
+
+
+__global__ void k_bf16_to_f32(const __nv_bfloat16* __restrict__ in,
+                              float* __restrict__ out, size_t n) {
+    size_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) out[i] = __bfloat162float(in[i]);
+}
+
+__global__ void k_f32_to_bf16(const float* __restrict__ in,
+                              __nv_bfloat16* __restrict__ out, size_t n) {
+    size_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) out[i] = __float2bfloat16(in[i]);
+}
+
+
+#ifndef USE_CURAND
+// Lightweight xorshift32 RNG per thread (benchmarking-friendly)
+__device__ inline uint32_t xorshift32(uint32_t x) {
+    x ^= x << 13; x ^= x >> 17; x ^= x << 5; return x;
+}
+
+__global__ void k_fill_uniform_bf16(__nv_bfloat16* out, size_t n,
+                                    uint64_t seed, float lo, float hi) {
+    size_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    // simple hash for per-thread seed diversity
+    uint32_t s = (uint32_t)(seed ^ (0x9E3779B97F4A7C15ULL * (i + 1)));
+    s = xorshift32(s);
+    // Convert to float in [0,1)
+    float u = (s & 0x007FFFFFu) * (1.0f / 8388608.0f); // 23-bit mantissa scale
+    float f = lo + (hi - lo) * u;
+    out[i] = __float2bfloat16(f);
+}
+#else
+// CURAND version (deterministic if you keep seed/sequence fixed)
+__global__ void k_fill_uniform_bf16(__nv_bfloat16* out, size_t n,
+                                    uint64_t seed, float lo, float hi) {
+    size_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    curandStatePhilox4_32_10_t st;
+    // each thread: unique subsequence = i, no offset
+    curand_init((unsigned long long)seed, (unsigned long long)i, 0ULL, &st);
+    float u = curand_uniform(&st);    // (0,1]
+    float f = lo + (hi - lo) * (u - 1e-7f); // nudge off 1.0 edge
+    out[i] = __float2bfloat16(f);
+}
+#endif
 
 // random initialize a buffer of float
 void random_float(float* buf, size_t size) {
@@ -105,13 +187,6 @@ void gemm_fp32(cublasHandle_t handle,
         CUBLAS_GEMM_DEFAULT_TENSOR_OP));
 }
 
-// FP32 -> BF16 cast (GPU)
-__global__ void k_f32_to_bf16(const float* __restrict__ in,
-                              __nv_bfloat16* __restrict__ out,
-                              size_t n) {
-    size_t i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) out[i] = __float2bfloat16(in[i]);
-}
 
 
 // Row-major BF16 GEMM: Y = X @ W^T
@@ -151,6 +226,79 @@ inline void gemm_rowmajor_bf16(cublasHandle_t handle,
         CUBLAS_GEMM_DEFAULT_TENSOR_OP // use tensor cores
     ));
 }
+
+
+// Shapes (row-major):
+//  X: [B, D],  W: [F, D],  Y: [B, F]
+// NOTE: W is stored as [F, D] row-major (i.e., expert W1^T layout).
+bool verify_bf16_gemm_cpu_sample(const __nv_bfloat16* dX,      // device ptr BF16 [B,D]
+                                 const __nv_bfloat16* dW,      // device ptr BF16 [F,D]
+                                 const __nv_bfloat16* dY,      // device ptr BF16 [B,F]
+                                 int B, int D, int F,
+                                 int num_samples = 10,
+                                 float atol = 5e-2f,
+                                 float rtol = 5e-2f,
+                                 uint64_t seed = 42ULL) {
+    const size_t nX = (size_t)B * D;
+    const size_t nW = (size_t)F * D;
+    const size_t nY = (size_t)B * F;
+
+    // 1) Copy device -> host (BF16)
+    std::vector<__nv_bfloat16> hX(nX), hW(nW), hY(nY);
+    cudaError_t e1 = cudaMemcpy(hX.data(), dX, nX * sizeof(__nv_bfloat16), cudaMemcpyDeviceToHost);
+    cudaError_t e2 = cudaMemcpy(hW.data(), dW, nW * sizeof(__nv_bfloat16), cudaMemcpyDeviceToHost);
+    cudaError_t e3 = cudaMemcpy(hY.data(), dY, nY * sizeof(__nv_bfloat16), cudaMemcpyDeviceToHost);
+    if (e1 != cudaSuccess || e2 != cudaSuccess || e3 != cudaSuccess) {
+        fprintf(stderr, "[VERIFY] cudaMemcpy D2H failed\n");
+        return false;
+    }
+
+    // 2) RNG for sampling (repeatable)
+    std::mt19937_64 rng(seed);
+    std::uniform_int_distribution<int> distB(0, B - 1);
+    std::uniform_int_distribution<int> distF(0, F - 1);
+
+    // 3) Sample and compare
+    int fails = 0;
+    double max_abs = 0.0, max_rel = 0.0;
+
+    // printf("[VERIFY] Sampling %d outputs out of %zu total...\n", num_samples, nY);
+
+    for (int s = 0; s < num_samples; ++s) {
+        int b = distB(rng);
+        int f = distF(rng);
+
+        // CPU FP32 reference: dot(X[b,:], W[f,:])
+        const __nv_bfloat16* xb = &hX[(size_t)b * D];
+        const __nv_bfloat16* wf = &hW[(size_t)f * D];
+
+        float ref = 0.0f;
+        for (int k = 0; k < D; ++k) {
+            float xk = __bfloat162float(xb[k]);
+            float wk = __bfloat162float(wf[k]);
+            ref += xk * wk;
+        }
+
+        float got = __bfloat162float(hY[(size_t)b * F + f]);
+        float abs_err = std::fabs(ref - got);
+        float rel_err = abs_err / (std::fabs(ref) + 1e-8f);
+
+        if (abs_err > max_abs) max_abs = abs_err;
+        if (rel_err > max_rel) max_rel = rel_err;
+
+        bool ok = (abs_err <= atol + rtol * std::fabs(ref));
+        // printf("  [%2d] (b=%d,f=%d): ref=% .6f  got=% .6f  abs=%.6f  rel=%.6f  %s\n",
+        //        s, b, f, ref, got, abs_err, rel_err, ok ? "OK" : "BAD");
+        if (!ok) ++fails;
+    }
+
+    // printf("[VERIFY] Summary: max_abs=%.6f  max_rel=%.6f  fails=%d/%d  (atol=%.2e rtol=%.2e)\n",
+    //        (float)max_abs, (float)max_rel, fails, num_samples, atol, rtol);
+
+    return fails == 0;
+}
+
+
 
 
 // Computes: Y = X @ W^T
@@ -330,4 +478,36 @@ inline void launch_silu_mul_fp32(const float* d_gate,
     const int block = 256;
     const int grid  = (N + block - 1) / block;
     silu_mul_fp32_kernel<<<grid, block, 0, stream>>>(d_gate, d_up, d_h, N);
+}
+
+// gate, up, h are all BF16 length N = B*F (row-major [B,F] flattened)
+__global__ void silu_mul_bf16_kernel(const __nv_bfloat16* __restrict__ gate,
+                                     const __nv_bfloat16* __restrict__ up,
+                                     __nv_bfloat16* __restrict__ h,
+                                     int N)
+{
+    int idx = blockDim.x * blockIdx.x + threadIdx.x;
+    if (idx >= N) return;
+
+    // Load BF16 -> FP32
+    float g = __bfloat162float(gate[idx]);
+    float u = __bfloat162float(up[idx]);
+
+    // SiLU(g) * up = (g * sigmoid(g)) * up
+    float out = (g * sigmoidf_fast(g)) * u;
+
+    // Store FP32 -> BF16
+    h[idx] = __float2bfloat16(out);
+}
+
+inline void launch_silu_mul_bf16(const __nv_bfloat16* d_gate,
+                                 const __nv_bfloat16* d_up,
+                                 __nv_bfloat16* d_h,
+                                 int B, int F,
+                                 cudaStream_t stream = 0)
+{
+    const int N = B * F;
+    const int block = 256;
+    const int grid  = (N + block - 1) / block;
+    silu_mul_bf16_kernel<<<grid, block, 0, stream>>>(d_gate, d_up, d_h, N);
 }

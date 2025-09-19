@@ -7,6 +7,7 @@ import torch
 import torch.nn.functional as F
 from torch.nn.utils.rnn import pad_sequence
 import transformers
+import torch.nn as nn
 
 
 def _pin_module_tensors(m: torch.nn.Module):
@@ -32,11 +33,14 @@ class FiddlerMixtral:
             # device_map='cpu',
             use_cache=True,
         )
+        
+        # reduce expert size
+        
+        
+        
         self.lm_head = self.model.lm_head
         self.model = self.model.model
-        self.expert_placeholder = copy.deepcopy(
-            self.model.layers[0].block_sparse_moe.experts[0]
-        ).to(self.dev)
+        
         self.tokenizer = transformers.AutoTokenizer.from_pretrained(args.model)
         self.tokenizer.pad_token = self.tokenizer.eos_token
         self.past_key_value = transformers.cache_utils.DynamicCache.from_legacy_cache()
@@ -45,6 +49,12 @@ class FiddlerMixtral:
         self.beam_width = args.beam_width
         self.n_layer = len(self.model.layers)
         self.n_expert = len(self.model.layers[0].block_sparse_moe.experts)
+        
+        self.replace_expert_size()
+        
+        self.expert_placeholder = copy.deepcopy(
+            self.model.layers[0].block_sparse_moe.experts[0]
+        ).to(self.dev)
        
 
         # TODO: find this value based on device config
@@ -62,6 +72,10 @@ class FiddlerMixtral:
         print(
             f"Number of experts on GPU: {n_expert_on_gpu}/{self.n_layer * self.n_expert}"
         )
+        
+        exp = self.model.layers[0].block_sparse_moe.experts[0]
+        for n, p in exp.named_parameters():
+            print(f"{n:20s} {tuple(p.shape)}  bias={getattr(getattr(exp, n.split('.')[0], None), 'bias', None) is not None}")
 
         self.set_expert_loc(n_expert_on_gpu)
         # print(self.expert_loc)
@@ -359,7 +373,19 @@ class FiddlerMixtral:
                 if self.is_expert_in_gpu(i, j):
                     self.model.layers[i].block_sparse_moe.experts[j].to(self.dev)
                     
-
+    def replace_expert_size(self, hidden_size=4096, new_intermediate=1024):
+        """Replace expert with smaller size to save GPU memory"""
+        
+        ref_param = next(self.model.layers[0].block_sparse_moe.experts[0].parameters())
+        dtype = ref_param.dtype
+        device = ref_param.device
+        for i in range(self.n_layer):
+            for j in range(self.n_expert):
+                exp = self.model.layers[i].block_sparse_moe.experts[j]
+                # replace with smaller size
+                exp.w1 = nn.Linear(hidden_size, new_intermediate, bias=False, dtype=dtype, device=device)  # gate
+                exp.w3 = nn.Linear(hidden_size, new_intermediate, bias=False, dtype=dtype, device=device)  # up
+                exp.w2 = nn.Linear(new_intermediate, hidden_size, bias=False, dtype=dtype, device=device)  # down
                     
     def bring_cold_experts_to_pinned_cpu(self):
         """
@@ -388,8 +414,9 @@ class FiddlerMixtral:
         # get the amount of free memory on GPU
         total_mem = torch.cuda.get_device_properties(self.dev).total_memory
         # free_mem = total_mem * 0.95 - torch.cuda.memory_allocated(self.dev) # TODO: magic number
-        free_mem = total_mem * 0.4 - torch.cuda.memory_allocated(self.dev) # TODO: magic number
-        return int((free_mem) // (n_param * 2))
+        # free_mem = total_mem * 0.4 - torch.cuda.memory_allocated(self.dev) # TODO: magic number
+        free_mem = total_mem * 0.95 - torch.cuda.memory_allocated(self.dev)
+        return min(int((free_mem) // (n_param * 2)), 256)
 
     def initial_beam_tensor(self, input_tensor):
         # transpose tensor of shape (beam_width, seq_len, beam_width) to (beam_width, 1) properly
@@ -634,12 +661,14 @@ class FiddlerMixtral:
                     torch.cuda.nvtx.range_pop()
                     
                     # print out device type of idx
-                    print(f"Layer {i_layer} Expert {i_expert} idx device: {idx.device}, top_2 device: {top_2.device}")
+                    # print(f"Layer {i_layer} Expert {i_expert} idx device: {idx.device}, top_2 device: {top_2.device}")
                     
                     torch.cuda.nvtx.range_push(f"layer-{i_layer}-expert-{i_expert}-append")
                     idxs.append(idx)
                     top_2s.append(top_2)
                     torch.cuda.nvtx.range_pop()
+                    
+                    print(f"Layer {i_layer} Expert {i_expert} has {top_2.shape[0]} tokens (total tokens{inps.shape[0]})")
                     
                     # # expected latency at CPU: number of token * cost_at_cpu
                     # # expected latency at GPU: cost_at_gpu (constant)
