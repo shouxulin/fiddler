@@ -2,7 +2,7 @@
 #include <cstdio>
 #include <chrono>
 #include <cstdlib>
-
+#include <fstream>
 #include <cstring>
 #include <algorithm>
 #include <omp.h>
@@ -94,14 +94,17 @@ int main(int argc, char* argv[]) {
     
     cudaDeviceSynchronize();
     auto start_time = std::chrono::high_resolution_clock::now();
+    float alpha = 1.5f;
     for (int i = 0; i < iter + warmup_iter; i++)
     {
         if (i == warmup_iter)
         {
+            cudaDeviceSynchronize();
             start_time = std::chrono::high_resolution_clock::now();
+            
         }
         
-        float alpha = 1.5f;
+        
         cudaMemcpy(d_A[i], A[i], n*sizeof(float), cudaMemcpyHostToDevice);
         add_alpha<float>(d_A[i], d_B[i], alpha, n);
     }
@@ -119,6 +122,13 @@ int main(int argc, char* argv[]) {
         cudaFree(d_A[i]);
         cudaFree(d_B[i]);
     }
+
+
+    // open the file in append mode
+    std::ofstream outfile;
+    outfile.open("results/native.csv", std::ios_base::app);
+    outfile << int(n * sizeof(float)) <<  "," << (elapsed.count() / iter) << std::endl;
+    outfile.close();
     
     
     return 0;

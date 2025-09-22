@@ -2,7 +2,7 @@
 #include <cstdio>
 #include <chrono>
 #include <cstdlib>
-
+#include <fstream>
 #include <cstring>
 #include <algorithm>
 #include <omp.h>
@@ -89,18 +89,37 @@ int main(int argc, char* argv[]) {
         cudaMalloc(&d_B[i], n*sizeof(float));
     }
     
+    float alpha = 1.5f;
+
     cudaDeviceSynchronize();
+    float latency_list[iter];
+
     auto start_time = std::chrono::high_resolution_clock::now();
     for (int i = 0; i < iter + warmup_iter; i++)
     {
         // std::cout << "Iteration " << i << std::endl;
         if (i == warmup_iter)
         {
+            cudaDeviceSynchronize();
             start_time = std::chrono::high_resolution_clock::now();
         }
+
+        // auto iter_start = std::chrono::high_resolution_clock::now();
         
-        float alpha = 1.5f;
+        
         add_alpha<float>(d_A[i], d_B[i], alpha, n);
+        // cudaDeviceSynchronize();
+
+        // if (i >= warmup_iter)
+        // {
+        //     auto iter_end = std::chrono::high_resolution_clock::now();
+        //     std::chrono::duration<double, std::micro> elapsed_iter = iter_end - iter_start;
+        //     float latency = elapsed_iter.count() / iter;
+        //     latency_list[i-warmup_iter] = latency;
+        // }
+        
+
+
     }
     cudaDeviceSynchronize();
     auto end_time = std::chrono::high_resolution_clock::now();
@@ -109,12 +128,26 @@ int main(int argc, char* argv[]) {
     std::cout << "Average time per iteration: " << latency_per_iter << " us" << " (" << iter << "iters)" << std::endl;
 
 
+    for (int i = 0; i < iter; i++)
+    {
+        std::cout << latency_list[i] << " ";
+    }
+    std::cout << std::endl;
+    
+
+
     cudaDeviceSynchronize();
     for (size_t i = 0; i < iter + warmup_iter; i++)
     {
         free(d_A[i]);
         cudaFree(d_B[i]);
     }
+
+    // open the file in append mode
+    std::ofstream outfile;
+    outfile.open("results/gh.csv", std::ios_base::app);
+    outfile << int(n * sizeof(float)) <<  "," << (elapsed.count() / iter) << std::endl;
+    outfile.close();
     
     
     return 0;
